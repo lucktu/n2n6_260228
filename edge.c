@@ -105,6 +105,7 @@ typedef char n2n_sn_name_t[N2N_EDGE_SN_HOST_SIZE];
 static int first_ip_report_shown = 0;
 static int default_ip_assignment = 0;
 static int assigned_ip_suffix = 1;
+static int initial_connection_complete = 0;
 
 /** Main structure type for edge. */
 struct n2n_edge
@@ -1767,9 +1768,9 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
 
     /* Send header */
     msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                       "  id    mac                wan_ip                                            version   os\n");
+                       "  id    mac                wan_ip                                            ver      os\n");
     msg_len += snprintf((char*) (udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
-                        "---n2n6-------------------------------------------------------------------------------n2n6---\n");
+                        "---n2n6--------------------------------------------------------------------------------------\n");
     sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
            (struct sockaddr*) &sender_sock, i);
 
@@ -1812,7 +1813,7 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
         const char *os_name = (peer->os_name[0] != '\0') ? peer->os_name : "unknown";
 
         msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                           " %2u     %-17s  %-48s  %-8s  %s\n",
+                           " %2u     %-17s  %-48s  %-7s  %s\n",
                            id++,
                            macaddr_str(mac, peer->mac_addr),
                            sock_to_cstr(sockaddr, &peer->sock),
@@ -1851,7 +1852,7 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
 
     /* Send statistics */
     msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                       "---n2n6-------------------------------------------------------------------------------n2n6---\n");
+                       "--------------------------------------------------------------------------------------n2n6---\n");
     sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
            (struct sockaddr*) &sender_sock, i);
 
@@ -2081,9 +2082,6 @@ static void readFromIPSocket( n2n_edge_t * eee )
 
   									          	  /* Only show report on first time or when IP changes */
    									          	 if (!first_ip_report_shown || ip_changed) {
-     									          	   traceEvent(TRACE_NORMAL, "============== IP Assignment Report ==============");
-        									          	traceEvent(TRACE_NORMAL, "Assigned IP: %s", assigned_ip_str);
-
        									          	 if (ra.peer_count > 0) {
            									          	 traceEvent(TRACE_NORMAL, "Community members (%u):", ra.peer_count);
            									          	 for (int i = 0; i < ra.peer_count && i < 16; i++) {
@@ -2110,6 +2108,19 @@ static void readFromIPSocket( n2n_edge_t * eee )
 									          	} else {
 										          		traceEvent(TRACE_DEBUG, "[OK] Edge Peer <<< =======64======= >>> Super Node");
 								          		}
+
+
+									          	if (!initial_connection_complete && eee->daemon) {  
+#ifdef N2N_HAVE_DAEMON  
+   									          	 useSyslog = 1; /* traceEvent output now goes to syslog. */  
+   									          	 prctl(PR_SET_KEEPCAPS, 1L);
+    									          	if ( -1 == daemon( 0, 0 ) ) {  
+       									          	 traceEvent( TRACE_ERROR, "Failed to become daemon." );  
+       									          	 exit(-5);  
+    									          	}  
+#endif  
+    									          	initial_connection_complete = 1;  
+									          	}
 
                     /* REVISIT: store sn_back */
                     eee->register_lifetime = ra.lifetime;
@@ -2872,17 +2883,6 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
         exit(1);
     }
 
-#ifdef N2N_HAVE_DAEMON
-    if ( eee.daemon )
-    {
-        useSyslog = 1; /* traceEvent output now goes to syslog. */
-        prctl(PR_SET_KEEPCAPS, 1L);
-        if ( -1 == daemon( 0, 0 ) ) {
-            traceEvent( TRACE_ERROR, "Failed to become daemon." );
-            exit(-5);
-        }
-    }
-#endif /* #ifdef N2N_HAVE_DAEMON */
     traceEvent( TRACE_NORMAL, "Starting n2n edge %s %s", n2n_sw_version, n2n_sw_buildDate );
 
     for (int i = 0; i< eee.sn_num; ++i) {
