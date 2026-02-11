@@ -791,7 +791,7 @@ static void send_register_super( n2n_edge_t * eee,
 
     if (default_ip_assignment) {
         reg.request_ip = 1;
-        reg.requested_ip = htonl(0x0a400001 + assigned_ip_suffix);
+        reg.requested_ip = htonl(0x0a400001 + assigned_ip_suffix); /* 10.64.0.x */
     } else if (eee->device.ip_addr != 0) {
         reg.request_ip = 1;
         reg.requested_ip = eee->device.ip_addr;
@@ -3106,8 +3106,13 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
         eee.mgmt_sock = open_socket(mgmt_port, 0 /* bind LOOPBACK*/ );
         if(eee.mgmt_sock == -1)
         {
-            traceEvent( TRACE_ERROR, "Failed to bind management socket %u", (unsigned int) mgmt_port);
-            return(-1);
+            if (mgmt_port == N2N_EDGE_MGMT_PORT) {
+                traceEvent( TRACE_WARNING, "Management socket %u already in use, running without management interface", (unsigned int) mgmt_port);
+                eee.mgmt_sock = -1;
+            } else {
+                traceEvent( TRACE_ERROR, "Failed to bind management socket %u", (unsigned int) mgmt_port);
+                return(-1);
+            }
         }
 #if !defined(_WIN32)
     }
@@ -3148,8 +3153,11 @@ static int run_loop(n2n_edge_t * eee )
 
         FD_ZERO(&socket_mask);
         FD_SET(eee->udp_sock, &socket_mask);
-        FD_SET(eee->mgmt_sock, &socket_mask);
-        max_sock = max((int) eee->udp_sock, (int) eee->mgmt_sock );
+        max_sock = (int) eee->udp_sock;
+        if (eee->mgmt_sock != -1) {
+            FD_SET(eee->mgmt_sock, &socket_mask);
+            max_sock = max(max_sock, (int) eee->mgmt_sock);
+        }
 #ifndef _WIN32
         FD_SET(eee->device.fd, &socket_mask);
         max_sock = max( (int) max_sock, (int) eee->device.fd );
@@ -3196,7 +3204,7 @@ static int run_loop(n2n_edge_t * eee )
                 readFromIPSocket(eee);
             }
 
-            if(FD_ISSET(eee->mgmt_sock, &socket_mask))
+            if(eee->mgmt_sock != -1 && FD_ISSET(eee->mgmt_sock, &socket_mask))
             {
                 readFromMgmtSocket(eee, &keep_running);
             }
