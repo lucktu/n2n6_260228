@@ -634,7 +634,7 @@ static void help() {
     printf("\n");
 
     printf("Usage: edge [config_file] <options>\n");
-    printf("or: edge -d <tun device> -a <tun IP address> -c <community> -k <encrypt key> -l <supernode host:port>\n");
+    printf("or: edge -a <tun IP address> -c <community> -k <encrypt key> -B <mode> -l <supernode host:port>\n");
     printf("or: edge -c <community> (default: -d n2nx -a 10.64.0.x -l ouno.eu.org:10084; no password, not secure, not recommended)\n");
     printf("\n");
 
@@ -656,10 +656,10 @@ static void help() {
     printf(", B3 = AES-CBC(-k)");
     #endif
     printf(", B5 = Speck(-k)\n");
-    printf("                         : '-B1' can also be used as '-B 1' (for better compatibility)\n");
+    printf("                         : '-B1' can also be used as '-B 1' (default: twofish)\n");
     printf("-k <encrypt key>         | Encryption key (ASCII, max 32) - also N2N_KEY=<encrypt key>. Not with -K.\n");
     printf("-K <key file>            | Specify a key schedule file to load. Not with -k.\n");
-    printf("-l <supernode host:port> | Supernode IP:port (default ouno.eu.org:10084)\n");
+    printf("-l <supernode host:port> | Supernode IP:port (default: ouno.eu.org:10084)\n");
     printf("-4/-6                    | Resolve supernode DNS name as IPv4 or IPv6 (default: auto)\n");
     printf("-p <local port>          | Fixed local UDP port.\n");
 #ifndef _WIN32
@@ -672,13 +672,13 @@ static void help() {
 #ifndef _WIN32
     printf("-m <MAC address>         | Fix MAC address for the TAP interface (otherwise it may be random)\n"
            "                         : eg. -m 01:02:03:04:05:06\n");
-    printf("-M <mtu>                 | Specify n2n MTU of edge interface (default %d).\n", DEFAULT_MTU);
+    printf("-M <mtu>                 | Specify n2n MTU of edge interface (default: %d).\n", DEFAULT_MTU);
 #endif
     printf("-r                       | Enable packet forwarding through n2n community.\n");
     printf("-R <dest>/<length>,<gw>  | Enable packet forwarding and add a route, IPv4/6 is autodetected\n");
-    printf("-E                       | Accept multicast MAC addresses (default=drop).\n");
+    printf("-E                       | Accept multicast MAC addresses (default: drop).\n");
     printf("-v                       | Make more verbose. Repeat as required.\n");
-    printf("-t <port|path>           | Management Socket (UDP Port or absolute path). (default %d)\n", N2N_EDGE_MGMT_PORT);
+    printf("-t <port|path>           | Management Socket (UDP Port or absolute path). (default: %d)\n", N2N_EDGE_MGMT_PORT);
     printf("-h                       | Show this help message\n");
 
     printf("\nEnvironment variables:\n");
