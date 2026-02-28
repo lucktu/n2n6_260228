@@ -1046,7 +1046,20 @@ static int process_udp( n2n_sn_t * sss,
 
         sss->stats.last_reg_super=now;
         ++(sss->stats.reg_super);
+        size_t reg_start_idx = idx;
         decode_REGISTER_SUPER( &reg, &cmn, udp_buf, &rem, &idx );
+
+        /* Extract dev_addr (net_addr + net_bitlen) from ntop's n2n_v2 */
+        uint32_t extra_requested_ip = 0;
+        uint8_t extra_net_bitlen = 0;
+        size_t dev_idx = reg_start_idx + N2N_COOKIE_SIZE + N2N_MAC_SIZE;
+        size_t dev_rem = udp_size - dev_idx;
+        size_t dev_pos = dev_idx;
+        if (dev_rem >= 5) {
+            decode_uint32(&extra_requested_ip, udp_buf, &dev_rem, &dev_pos);
+            extra_requested_ip = ntohl(extra_requested_ip);
+            decode_uint8(&extra_net_bitlen, udp_buf, &dev_rem, &dev_pos);
+        }
 
         cmn2.ttl = N2N_DEFAULT_TTL;
         cmn2.pc = n2n_register_super_ack;
@@ -1076,8 +1089,15 @@ static int process_udp( n2n_sn_t * sss,
                     macaddr_str( mac_buf, reg.edgeMac ),
                     sock_to_cstr( sockbuf, &(ack.sock) ) );
 
+        uint8_t use_request_ip = reg.request_ip;
+        uint32_t use_requested_ip = reg.requested_ip;
+        if (extra_requested_ip != 0) {
+            use_request_ip = 1;
+            use_requested_ip = extra_requested_ip;
+        }
+
         update_edge( sss, reg.edgeMac, cmn.community, &(ack.sock), now,
-                     reg.version, reg.os_name, reg.request_ip, reg.requested_ip );
+                     reg.version, reg.os_name, use_request_ip, use_requested_ip );
 
         strncpy(ack.version, n2n_sw_version, sizeof(ack.version) - 1);
         strncpy(ack.os_name, n2n_sw_osName, sizeof(ack.os_name) - 1);
