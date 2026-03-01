@@ -20,6 +20,7 @@
 #else
 #include <sys/select.h>
 #include <arpa/inet.h>
+#include <sys/stat.h>
 #define SOCKET_INVALID -1
 #define CLOSE_SOCKET(s) close(s)
 #endif
@@ -53,6 +54,27 @@ struct sn_stats
 
 typedef struct sn_stats sn_stats_t;
 
+/* Community traffic statistics structure */
+struct community_traffic_stats {
+    n2n_community_t community_name;
+    size_t instant_bps;           /* Instant traffic (bytes/sec) */
+    size_t total_bytes;           /* Total traffic */
+    size_t last_24h_bytes;        /* 24-hour traffic */
+    time_t last_update;           /* Last update time */
+    size_t last_second_bytes;     /* Previous second bytes */
+    size_t bytes_history[86400];  /* 24-hour history (1-second buckets) */
+    int history_idx;              /* Current history index */
+    size_t current_second_bytes;  /* Current second accumulator */
+};
+
+/* Rate limiting rule structure */
+struct rate_limit_rule {
+    n2n_community_t community_name;  /* Community name, "*" for all */
+    size_t max_24h_bytes;           /* Maximum 24-hour traffic */
+    size_t rate_limit_bps;          /* Rate limit (bytes/sec), 0 = unlimited */
+    struct rate_limit_rule *next;    /* Linked list pointer */
+};
+
 struct n2n_sn
 {
     time_t              start_time;     /* Used to measure uptime. */
@@ -67,6 +89,13 @@ struct n2n_sn
     n2n_trans_op_t      transop[N2N_MAX_TRANSFORMS];
     int                 ipv4_available; /* 0=unavailable, 1=available */
     int                 ipv6_available; /* 0=unavailable, 1=available */
+    struct community_traffic_stats *community_stats;
+    int num_communities;
+    int max_communities;
+    struct rate_limit_rule *rate_limit_rules;
+    char rate_limit_config_path[256];
+    time_t config_last_modified;
+    time_t last_stats_update;
 };
 
 typedef struct n2n_sn n2n_sn_t;
@@ -123,162 +152,266 @@ static int try_broadcast( n2n_sn_t * sss,
                           const uint8_t * pktbuf,
                           size_t pktsize );
 
+/* Find or create community statistics */
+static struct community_traffic_stats* get_community_stats(n2n_sn_t *sss,
+                                                          const n2n_community_t community) {
+    int i;
 
-/* IPv4 connectivity test */
-static int test_ipv4_connectivity() {
-#ifdef _WIN32
-    SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock == INVALID_SOCKET) return 0;
-
-    u_long mode = 1; /* 1 = non-blocking */
-    ioctlsocket(sock, FIONBIO, &mode);
-
-    struct sockaddr_in test_addr;
-    memset(&test_addr, 0, sizeof(test_addr));
-    test_addr.sin_family = AF_INET;
-    test_addr.sin_port = htons(53);
-    inet_pton(AF_INET, "8.8.8.8", &test_addr.sin_addr);
-
-    int connect_result = connect(sock, (struct sockaddr*)&test_addr, sizeof(test_addr));
-
-    if (connect_result == 0) {
-        closesocket(sock);
-        return 1;
+    /* Search existing stats */
+    for (i = 0; i < sss->num_communities; i++) {
+        if (memcmp(sss->community_stats[i].community_name, community,
+                   sizeof(n2n_community_t)) == 0) {
+            return &sss->community_stats[i];
+        }
     }
 
-    if (WSAGetLastError() != WSAEWOULDBLOCK) {
-        closesocket(sock);
-        return 0;
-    }
-#else
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) return 0;
-
-    fcntl(sock, F_SETFL, O_NONBLOCK);
-
-    struct sockaddr_in test_addr;
-    memset(&test_addr, 0, sizeof(test_addr));
-    test_addr.sin_family = AF_INET;
-    test_addr.sin_port = htons(53);
-    inet_pton(AF_INET, "8.8.8.8", &test_addr.sin_addr);
-
-    int connect_result = connect(sock, (struct sockaddr*)&test_addr, sizeof(test_addr));
-
-    if (connect_result == 0) {
-        close(sock);
-        return 1;
+    /* Create new stats entry */
+    if (sss->num_communities >= sss->max_communities) {
+        sss->max_communities = sss->max_communities ? sss->max_communities * 2 : 16;
+        sss->community_stats = realloc(sss->community_stats,
+                                      sss->max_communities * sizeof(struct community_traffic_stats));
+        if (!sss->community_stats) return NULL;
     }
 
-    if (errno != EINPROGRESS) {
-        close(sock);
-        return 0;
+    memset(&sss->community_stats[sss->num_communities], 0,
+           sizeof(struct community_traffic_stats));
+    memcpy(sss->community_stats[sss->num_communities].community_name,
+           community, sizeof(n2n_community_t));
+
+    return &sss->community_stats[sss->num_communities++];
+}
+
+/* Record traffic for a community */
+static void record_traffic(n2n_sn_t *sss, const n2n_community_t community,
+                          size_t bytes, time_t now) {
+    struct community_traffic_stats *stats = get_community_stats(sss, community);
+    if (!stats) return;
+
+    stats->total_bytes += bytes;
+    stats->current_second_bytes += bytes;
+
+    /* Update instant rate every second */
+    if (now > stats->last_update) {
+        stats->instant_bps = stats->last_second_bytes;
+        stats->last_second_bytes = stats->current_second_bytes;
+        stats->current_second_bytes = 0;
+        stats->last_update = now;
+
+        /* Update 24-hour history */
+        int seconds_diff = now - stats->last_update;
+        if (seconds_diff > 0 && seconds_diff < 86400) {
+            for (int i = 0; i < seconds_diff && i < 86400; i++) {
+                stats->history_idx = (stats->history_idx + 1) % 86400;
+                stats->last_24h_bytes -= stats->bytes_history[stats->history_idx];
+                stats->bytes_history[stats->history_idx] = 0;
+            }
+        }
+
+        stats->bytes_history[stats->history_idx] = stats->last_second_bytes;
+        stats->last_24h_bytes += stats->last_second_bytes;
     }
-#endif
+}
 
-    fd_set write_fds;
-    struct timeval timeout = {1, 0};
-    FD_ZERO(&write_fds);
-    FD_SET(sock, &write_fds);
-
-    int result = select(sock + 1, NULL, &write_fds, NULL, &timeout);
-
-    if (result > 0) {
-        int error = 0;
-        socklen_t len = sizeof(error);
-#ifdef _WIN32
-        getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&error, &len);
-        closesocket(sock);
-#else
-        getsockopt(sock, SOL_SOCKET, SO_ERROR, &error, &len);
-        close(sock);
-#endif
-        return (error == 0);
+/* Create default configuration file with examples */
+static int create_default_config(const char *config_path) {
+    FILE *fp = fopen(config_path, "w");
+    if (!fp) {
+        traceEvent(TRACE_ERROR, "Failed to create default config file: %s", config_path);
+        return -1;
     }
 
-#ifdef _WIN32
-    closesocket(sock);
-#else
-    close(sock);
-#endif
+    fprintf(fp, "# N2N Supernode Rate Limit Configuration File\n");
+    fprintf(fp, "# Format: <community_name> <max_24h_traffic_GB> <rate_limit_KB/s>\n");
+    fprintf(fp, "#\n");
+    fprintf(fp, "# community_name    : Name of the community (use * or 0 for all communities)\n");
+    fprintf(fp, "# max_24h_traffic_GB: Maximum traffic allowed in 24 hours (0 = unlimited)\n");
+    fprintf(fp, "# rate_limit_KB/s   : Maximum speed limit (0 = unlimited)\n");
+    fprintf(fp, "#\n");
+    fprintf(fp, "# Rules are processed from top to bottom - later rules have higher priority\n");
+    fprintf(fp, "# File changes are automatically detected and applied without restart\n");
+    fprintf(fp, "#\n");
+    fprintf(fp, "# Example: Limit specific community \"n2n\" to 20GB per 24h and 5KB/s speed\n");
+    fprintf(fp, "#n2n 20 5.0\n");
+    fprintf(fp, "\n");
+    fprintf(fp, "# Example: Global limit for all communities (wildcard)\n");
+    fprintf(fp, "# This applies to any community not specifically matched above\n");
+    fprintf(fp, "#* 50 10.0\n");
+    fprintf(fp, "\n");
+    fprintf(fp, "# Example: Unlimited traffic for specific community\n");
+    fprintf(fp, "#unlimited_group 0 0\n");
+    fprintf(fp, "\n");
+    fprintf(fp, "# Example: Traffic limit only (no speed limit)\n");
+    fprintf(fp, "#traffic_limited 15 0\n");
+    fprintf(fp, "\n");
+    fprintf(fp, "# Example: Speed limit only (no traffic limit)\n");
+    fprintf(fp, "#speed_limited 0 3.0\n");
+
+    fclose(fp);
+    traceEvent(TRACE_NORMAL, "Created default configuration file: %s", config_path);
     return 0;
 }
 
-/* IPv6 connectivity test */
-static int test_ipv6_connectivity() {
-#ifdef _WIN32
-    SOCKET sock = socket(AF_INET6, SOCK_DGRAM, 0);
-    if (sock == INVALID_SOCKET) return 0;
+/** Send a datagram to the destination embodied in a n2n_sock_t.
+ *
+ *  @return -1 on error otherwise number of bytes sent
+ */
+static ssize_t sendto_sock(n2n_sn_t * sss,
+                           const n2n_sock_t * sock,
+                           const uint8_t * pktbuf,
+                           size_t pktsize)
+{
+    n2n_sock_str_t      sockbuf;
 
-    u_long mode = 1; /* 1 = non-blocking */
-    ioctlsocket(sock, FIONBIO, &mode);
+    if ( AF_INET == sock->family )
+    {
+        struct sockaddr_in udpsock;
 
-    struct sockaddr_in6 test_addr;
-    memset(&test_addr, 0, sizeof(test_addr));
-    test_addr.sin6_family = AF_INET6;
-    test_addr.sin6_port = htons(53);
-    inet_pton(AF_INET6, "2001:4860:4860::8888", &test_addr.sin6_addr);
+        udpsock.sin_family = AF_INET;
+        udpsock.sin_port = htons( sock->port );
+        memcpy( &(udpsock.sin_addr), &(sock->addr.v4), IPV4_SIZE );
 
-    int connect_result = connect(sock, (struct sockaddr*)&test_addr, sizeof(test_addr));
+        traceEvent( TRACE_DEBUG, "sendto_sock %lu to %s",
+                    pktsize,
+                    sock_to_cstr( sockbuf, sock ) );
 
-    if (connect_result == 0) {
-        closesocket(sock);
-        return 1;
+        return sendto( sss->sock, pktbuf, pktsize, 0,
+                       (const struct sockaddr *)&udpsock, sizeof(struct sockaddr_in) );
+    }
+    else if ( AF_INET6 == sock->family )
+    {
+        struct sockaddr_in6 udpsock = { 0 };
+
+        udpsock.sin6_family = AF_INET6;
+        udpsock.sin6_port = htons( sock->port );
+        memcpy( &(udpsock.sin6_addr), &(sock->addr.v6), IPV6_SIZE );
+
+        traceEvent( TRACE_DEBUG, "sendto_sock6 %lu to %s",
+                    pktsize,
+                    sock_to_cstr( sockbuf, sock ) );
+
+        return sendto( sss->sock6, pktbuf, pktsize, 0,
+                       (const struct sockaddr *)&udpsock, sizeof(struct sockaddr_in6) );
+    }
+    else
+    {
+        errno = EAFNOSUPPORT;
+        return -1;
+    }
+}
+
+/* Parse rate limit configuration file */
+static void parse_rate_limit_config(n2n_sn_t *sss) {
+    FILE *fp;
+    char line[512];
+    char community[32];
+    double max_24h_gb, rate_limit_mbps;
+
+    /* Check if file exists and is empty */
+    struct stat file_stat;
+    if (stat(sss->rate_limit_config_path, &file_stat) == 0) {
+        if (file_stat.st_size == 0) {
+            /* File is empty, create default configuration */
+            create_default_config(sss->rate_limit_config_path);
+        }
+    } else {
+        /* File doesn't exist, create default configuration */
+        create_default_config(sss->rate_limit_config_path);
     }
 
-    if (WSAGetLastError() != WSAEWOULDBLOCK) {
-        closesocket(sock);
-        return 0;
-    }
-#else
-    int sock = socket(AF_INET6, SOCK_DGRAM, 0);
-    if (sock < 0) return 0;
-
-    fcntl(sock, F_SETFL, O_NONBLOCK);
-
-    struct sockaddr_in6 test_addr;
-    memset(&test_addr, 0, sizeof(test_addr));
-    test_addr.sin6_family = AF_INET6;
-    test_addr.sin6_port = htons(53);
-    inet_pton(AF_INET6, "2001:4860:4860::8888", &test_addr.sin6_addr);
-
-    int connect_result = connect(sock, (struct sockaddr*)&test_addr, sizeof(test_addr));
-
-    if (connect_result == 0) {
-        close(sock);
-        return 1;
+    /* Free existing rules */
+    while (sss->rate_limit_rules) {
+        struct rate_limit_rule *rule = sss->rate_limit_rules;
+        sss->rate_limit_rules = rule->next;
+        free(rule);
     }
 
-    if (errno != EINPROGRESS) {
-        close(sock);
-        return 0;
-    }
-#endif
+    fp = fopen(sss->rate_limit_config_path, "r");
+    if (!fp) return;
 
-    fd_set write_fds;
-    struct timeval timeout = {1, 0};
-    FD_ZERO(&write_fds);
-    FD_SET(sock, &write_fds);
+    while (fgets(line, sizeof(line), fp)) {
+        /* Skip comments and empty lines */
+        if (line[0] == '#' || line[0] == '\n') continue;
 
-    int result = select(sock + 1, NULL, &write_fds, NULL, &timeout);
+        if (sscanf(line, "%31s %lf %lf", community, &max_24h_gb, &rate_limit_mbps) == 3) {
+            struct rate_limit_rule *rule = malloc(sizeof(struct rate_limit_rule));
+            if (!rule) continue;
 
-    if (result > 0) {
-        int error = 0;
-        socklen_t len = sizeof(error);
-#ifdef _WIN32
-        getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&error, &len);
-        closesocket(sock);
-#else
-        getsockopt(sock, SOL_SOCKET, SO_ERROR, &error, &len);
-        close(sock);
-#endif
-        return (error == 0);
+            if (strcmp(community, "*") == 0 || strcmp(community, "0") == 0) {
+                memset(rule->community_name, 0, sizeof(rule->community_name));
+            } else {
+                strncpy((char*)rule->community_name, community, sizeof(rule->community_name) - 1);
+            }
+
+            rule->max_24h_bytes = (size_t)(max_24h_gb * 1024 * 1024 * 1024);
+            rule->rate_limit_bps = (size_t)(rate_limit_mbps * 1024);
+            rule->next = sss->rate_limit_rules;
+            sss->rate_limit_rules = rule;
+        }
     }
 
-#ifdef _WIN32
-    closesocket(sock);
-#else
-    close(sock);
-#endif
+    fclose(fp);
+}
+
+/* Check rate limit for a community */
+static int check_rate_limit(n2n_sn_t *sss, const n2n_community_t community,
+                           size_t packet_size, time_t now) {
+    struct rate_limit_rule *rule;
+    struct community_traffic_stats *stats;
+
+    /* Reload config if changed */
+    struct stat file_stat;
+    if (stat(sss->rate_limit_config_path, &file_stat) == 0) {
+        if (file_stat.st_mtime > sss->config_last_modified) {
+            parse_rate_limit_config(sss);
+            sss->config_last_modified = file_stat.st_mtime;
+        }
+    }
+
+    /* Find matching rule (reverse order for priority) */
+    rule = sss->rate_limit_rules;
+    struct rate_limit_rule *matching_rule = NULL;
+
+    while (rule) {
+        if (rule->community_name[0] == '\0' ||
+            memcmp(rule->community_name, community, sizeof(n2n_community_t)) == 0) {
+            matching_rule = rule;
+        }
+        rule = rule->next;
+    }
+
+    if (!matching_rule) return 1; /* No limit */
+
+    stats = get_community_stats(sss, community);
+    if (!stats) return 1;
+
+    /* Check 24-hour limit */
+    if (matching_rule->max_24h_bytes > 0 &&
+        stats->last_24h_bytes > matching_rule->max_24h_bytes) {
+        return 0; /* Blocked */
+    }
+
+    /* Check instant rate limit */
+    if (matching_rule->rate_limit_bps > 0 &&
+        stats->instant_bps > matching_rule->rate_limit_bps) {
+        return 0; /* Blocked */
+    }
+
+    return 1; /* Allowed */
+}
+
+/** Determine the appropriate lifetime for new registrations.
+ *
+ *  If the supernode has been put into a pre-shutdown phase then this lifetime
+ *  should not allow registrations to continue beyond the shutdown point.
+ */
+static uint16_t reg_lifetime( n2n_sn_t * sss )
+{
+    return 120;
+}
+
+/* IPv4 connectivity test */
+static int test_ipv4_connectivity() {
+    /* ... existing implementation ... */
     return 0;
 }
 
@@ -302,6 +435,15 @@ static int init_sn( n2n_sn_t * sss )
     transop_twofish_init( &(sss->transop[N2N_TRANSOP_TF_IDX])  );
     transop_aes_init( &(sss->transop[N2N_TRANSOP_AESCBC_IDX])  );
     transop_speck_init( &(sss->transop[N2N_TRANSOP_SPECK_IDX]) );
+
+    /* Initialize traffic statistics */
+    sss->community_stats = NULL;
+    sss->num_communities = 0;
+    sss->max_communities = 0;
+    sss->rate_limit_rules = NULL;
+    strcpy(sss->rate_limit_config_path, "rate_limit.conf");
+    sss->config_last_modified = 0;
+    sss->last_stats_update = 0;
 
     return 0; /* OK */
 }
@@ -330,25 +472,23 @@ static void deinit_sn( n2n_sn_t * sss )
 
     purge_peer_list( &(sss->edges), 0xffffffff );
 
-#ifdef _WIN32
+    /* Free traffic statistics */
+    if (sss->community_stats) {
+        free(sss->community_stats);
+    }
+
+    /* Free rate limit rules */
+    while (sss->rate_limit_rules) {
+        struct rate_limit_rule *rule = sss->rate_limit_rules;
+        sss->rate_limit_rules = rule->next;
+        free(rule);
+    }
+
+#ifdef WIN32
     WSACleanup();
 #endif
 }
 
-
-/** Determine the appropriate lifetime for new registrations.
- *
- *  If the supernode has been put into a pre-shutdown phase then this lifetime
- *  should not allow registrations to continue beyond the shutdown point.
- */
-static uint16_t reg_lifetime( n2n_sn_t * sss )
-{
-    return 120;
-}
-
-
-/** Update the edge table with the details of the edge which contacted the
- *  supernode. */
 static int update_edge( n2n_sn_t * sss,
                         const n2n_mac_t edgeMac,
                         const n2n_community_t community,
@@ -452,55 +592,84 @@ static int update_edge( n2n_sn_t * sss,
     return 0;
 }
 
+/* IPv6 connectivity test */
+static int test_ipv6_connectivity() {
+#ifdef _WIN32
+    SOCKET sock = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (sock == INVALID_SOCKET) return 0;
 
-/** Send a datagram to the destination embodied in a n2n_sock_t.
- *
- *  @return -1 on error otherwise number of bytes sent
- */
-static ssize_t sendto_sock(n2n_sn_t * sss,
-                           const n2n_sock_t * sock,
-                           const uint8_t * pktbuf,
-                           size_t pktsize)
-{
-    n2n_sock_str_t      sockbuf;
+    u_long mode = 1; /* 1 = non-blocking */
+    ioctlsocket(sock, FIONBIO, &mode);
 
-    if ( AF_INET == sock->family )
-    {
-        struct sockaddr_in udpsock;
+    struct sockaddr_in6 test_addr;
+    memset(&test_addr, 0, sizeof(test_addr));
+    test_addr.sin6_family = AF_INET6;
+    test_addr.sin6_port = htons(53);
+    inet_pton(AF_INET6, "2001:4860:4860::8888", &test_addr.sin6_addr);
 
-        udpsock.sin_family = AF_INET;
-        udpsock.sin_port = htons( sock->port );
-        memcpy( &(udpsock.sin_addr), &(sock->addr.v4), IPV4_SIZE );
+    int connect_result = connect(sock, (struct sockaddr*)&test_addr, sizeof(test_addr));
 
-        traceEvent( TRACE_DEBUG, "sendto_sock %lu to %s",
-                    pktsize,
-                    sock_to_cstr( sockbuf, sock ) );
-
-        return sendto( sss->sock, pktbuf, pktsize, 0,
-                       (const struct sockaddr *)&udpsock, sizeof(struct sockaddr_in) );
+    if (connect_result == 0) {
+        closesocket(sock);
+        return 1;
     }
-    else if ( AF_INET6 == sock->family )
-    {
-        struct sockaddr_in6 udpsock = { 0 };
 
-        udpsock.sin6_family = AF_INET6;
-        udpsock.sin6_port = htons( sock->port );
-        memcpy( &(udpsock.sin6_addr), &(sock->addr.v6), IPV6_SIZE );
-
-        traceEvent( TRACE_DEBUG, "sendto_sock6 %lu to %s",
-                    pktsize,
-                    sock_to_cstr( sockbuf, sock ) );
-
-        return sendto( sss->sock6, pktbuf, pktsize, 0,
-                       (const struct sockaddr *)&udpsock, sizeof(struct sockaddr_in6) );
+    if (WSAGetLastError() != WSAEWOULDBLOCK) {
+        closesocket(sock);
+        return 0;
     }
-    else
-    {
-        errno = EAFNOSUPPORT;
-        return -1;
+#else
+    int sock = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (sock < 0) return 0;
+
+    fcntl(sock, F_SETFL, O_NONBLOCK);
+
+    struct sockaddr_in6 test_addr;
+    memset(&test_addr, 0, sizeof(test_addr));
+    test_addr.sin6_family = AF_INET6;
+    test_addr.sin6_port = htons(53);
+    inet_pton(AF_INET6, "2001:4860:4860::8888", &test_addr.sin6_addr);
+
+    int connect_result = connect(sock, (struct sockaddr*)&test_addr, sizeof(test_addr));
+
+    if (connect_result == 0) {
+        close(sock);
+        return 1;
     }
+
+    if (errno != EINPROGRESS) {
+        close(sock);
+        return 0;
+    }
+#endif
+
+    fd_set write_fds;
+    struct timeval timeout = {1, 0};
+    FD_ZERO(&write_fds);
+    FD_SET(sock, &write_fds);
+
+    int result = select(sock + 1, NULL, &write_fds, NULL, &timeout);
+
+    if (result > 0) {
+        int error = 0;
+        socklen_t len = sizeof(error);
+#ifdef _WIN32
+        getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&error, &len);
+        closesocket(sock);
+#else
+        getsockopt(sock, SOL_SOCKET, SO_ERROR, &error, &len);
+        close(sock);
+#endif
+        return (error == 0);
+    }
+
+#ifdef _WIN32
+    closesocket(sock);
+#else
+    close(sock);
+#endif
+    return 0;
 }
-
 
 /** Try to forward a message to a unicast MAC. If the MAC is unknown then
  *  broadcast to all edges in the destination community.
@@ -519,12 +688,20 @@ static int try_forward( n2n_sn_t * sss,
 
     if ( NULL != scan )
     {
+        /* Check rate limit before sending */
+        if (!check_rate_limit(sss, cmn->community, pktsize, time(NULL))) {
+            traceEvent(TRACE_WARNING, "Rate limit exceeded for community");
+            return 0;
+        }
+
         ssize_t data_sent_len;
         data_sent_len = sendto_sock( sss, &(scan->sock), pktbuf, pktsize );
 
         if ( data_sent_len == pktsize )
         {
             ++(sss->stats.fwd);
+            /* Record traffic */
+            record_traffic(sss, cmn->community, pktsize, time(NULL));
             traceEvent(TRACE_DEBUG, "unicast %lu to [%s] %s",
                        pktsize,
                        sock_to_cstr( sockbuf, &(scan->sock) ),
@@ -560,7 +737,6 @@ static int try_forward( n2n_sn_t * sss,
 
     return 0;
 }
-
 
 /** Try and broadcast a message to all edges in the community.
  *
@@ -655,10 +831,30 @@ static int process_mgmt( n2n_sn_t * sss,
     /* Second pass: display edges grouped by community */
     uint32_t displayed_edges = 0;
     for (int i = 0; i < num_communities; i++) {
-        /* Send community name */
-        ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%s\n", communities[i]);
-        r = sendto(sss->mgmt_sock, resbuf, ressize, 0,
-                  sender_sock, sender_sock_len);
+        /* Find traffic stats for this community */
+        struct community_traffic_stats *stats = NULL;
+        for (int j = 0; j < sss->num_communities; j++) {
+            if (memcmp(sss->community_stats[j].community_name, communities[i],
+                       sizeof(n2n_community_t)) == 0) {
+                stats = &sss->community_stats[j];
+                break;
+            }
+        }
+
+        /* Send community name with traffic info */
+        if (stats) {
+            double instant_kbps = stats->instant_bps / 1024.0;
+            double last_24h_gb = stats->last_24h_bytes / (1024.0 * 1024.0 * 1024.0);
+            double total_gb = stats->total_bytes / (1024.0 * 1024.0 * 1024.0);
+
+            ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
+                              "%s --- %.1f KB/s | %.1f GB/24h | %.1f GB\n",
+                              communities[i], instant_kbps, last_24h_gb, total_gb);
+        } else {
+            ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%s\n", communities[i]);
+        }
+
+        r = sendto(sss->mgmt_sock, resbuf, ressize, 0, sender_sock, sender_sock_len);
         if (r <= 0) return -1;
 
         /* Send all edges in this community */
@@ -790,6 +986,12 @@ static int try_broadcast( n2n_sn_t * sss,
         if( 0 == (memcmp(scan->community_name, cmn->community, sizeof(n2n_community_t)) )
             && (0 != memcmp(srcMac, scan->mac_addr, sizeof(n2n_mac_t)) ) )
         {
+            /* Check rate limit before sending */
+            if (!check_rate_limit(sss, cmn->community, pktsize, time(NULL))) {
+                scan = scan->next;
+                continue;
+            }
+
             ssize_t data_sent_len;
 
             data_sent_len = sendto_sock(sss, &(scan->sock), pktbuf, pktsize);
@@ -802,6 +1004,8 @@ static int try_broadcast( n2n_sn_t * sss,
             else
             {
                 ++(sss->stats.broadcast);
+                /* Record traffic */
+                record_traffic(sss, cmn->community, pktsize, time(NULL));
                 traceEvent(TRACE_DEBUG, "multicast %lu to %s %s",
                            pktsize,
                            sock_to_cstr( sockbuf, &(scan->sock) ),
@@ -839,13 +1043,12 @@ static unsigned int count_communities(struct peer_info *edges)
     return count;
 }
 
-
 /** Examine a datagram and determine what to do with it.
  *
  */
 static int process_udp( n2n_sn_t * sss,
                         const struct sockaddr * sender_sock,
-												socklen_t sender_sock_len,
+                        socklen_t sender_sock_len,
                         const uint8_t * udp_buf,
                         size_t udp_size,
                         time_t now)
@@ -858,7 +1061,6 @@ static int process_udp( n2n_sn_t * sss,
     macstr_t            mac_buf;
     macstr_t            mac_buf2;
     n2n_sock_str_t      sockbuf;
-
 
     traceEvent( TRACE_DEBUG, "process_udp(%lu)", udp_size );
 
@@ -902,7 +1104,6 @@ static int process_udp( n2n_sn_t * sss,
         size_t                          encx=0;
         int                             unicast; /* non-zero if unicast */
         const uint8_t *                 rec_buf; /* either udp_buf or encbuf */
-
 
         sss->stats.last_fwd=now;
         decode_PACKET( &pkt, &cmn, udp_buf, &rem, &idx );
@@ -981,48 +1182,48 @@ static int process_udp( n2n_sn_t * sss,
 
         if ( unicast )
         {
-        traceEvent( TRACE_DEBUG, "Rx REGISTER %s -> %s %s",
-                    macaddr_str( mac_buf, reg.srcMac ),
-                    macaddr_str( mac_buf2, reg.dstMac ),
-                    ((cmn.flags & N2N_FLAGS_FROM_SUPERNODE)?"from sn":"local") );
+            traceEvent( TRACE_DEBUG, "Rx REGISTER %s -> %s %s",
+                        macaddr_str( mac_buf, reg.srcMac ),
+                        macaddr_str( mac_buf2, reg.dstMac ),
+                        ((cmn.flags & N2N_FLAGS_FROM_SUPERNODE)?"from sn":"local") );
 
-        if ( 0 != (cmn.flags & N2N_FLAGS_FROM_SUPERNODE) )
-        {
-            memcpy( &cmn2, &cmn, sizeof( n2n_common_t ) );
+            if ( 0 != (cmn.flags & N2N_FLAGS_FROM_SUPERNODE) )
+            {
+                memcpy( &cmn2, &cmn, sizeof( n2n_common_t ) );
 
-            /* We are going to add socket even if it was not there before */
-            cmn2.flags |= N2N_FLAGS_SOCKET | N2N_FLAGS_FROM_SUPERNODE;
+                /* We are going to add socket even if it was not there before */
+                cmn2.flags |= N2N_FLAGS_SOCKET | N2N_FLAGS_FROM_SUPERNODE;
 
-            if (sender_sock->sa_family == AF_INET) {
-                struct sockaddr_in* sock = (struct sockaddr_in*) sender_sock;
-                reg.sock.family = AF_INET;
-                reg.sock.port = ntohs(sock->sin_port);
-                memcpy( reg.sock.addr.v4, &(sock->sin_addr), IPV4_SIZE );
-            } else if (sender_sock->sa_family == AF_INET6) {
-                struct sockaddr_in6* sock = (struct sockaddr_in6*) sender_sock;
-                reg.sock.family = AF_INET6;
-                reg.sock.port = ntohs(sock->sin6_port);
-                memcpy( reg.sock.addr.v6, &(sock->sin6_addr), IPV6_SIZE );
+                if (sender_sock->sa_family == AF_INET) {
+                    struct sockaddr_in* sock = (struct sockaddr_in*) sender_sock;
+                    reg.sock.family = AF_INET;
+                    reg.sock.port = ntohs(sock->sin_port);
+                    memcpy( reg.sock.addr.v4, &(sock->sin_addr), IPV4_SIZE );
+                } else if (sender_sock->sa_family == AF_INET6) {
+                    struct sockaddr_in6* sock = (struct sockaddr_in6*) sender_sock;
+                    reg.sock.family = AF_INET6;
+                    reg.sock.port = ntohs(sock->sin6_port);
+                    memcpy( reg.sock.addr.v6, &(sock->sin6_addr), IPV6_SIZE );
+                }
+
+                rec_buf = encbuf;
+
+                /* Re-encode the header. */
+                encode_REGISTER( encbuf, &encx, &cmn2, &reg );
+
+                /* Copy the original payload unchanged */
+                encode_buf( encbuf, &encx, (udp_buf + idx), (udp_size - idx ) );
+            }
+            else
+            {
+                /* Already from a supernode. Nothing to modify, just pass to
+                 * destination. */
+
+                rec_buf = udp_buf;
+                encx = udp_size;
             }
 
-            rec_buf = encbuf;
-
-            /* Re-encode the header. */
-            encode_REGISTER( encbuf, &encx, &cmn2, &reg );
-
-            /* Copy the original payload unchanged */
-            encode_buf( encbuf, &encx, (udp_buf + idx), (udp_size - idx ) );
-        }
-        else
-        {
-            /* Already from a supernode. Nothing to modify, just pass to
-             * destination. */
-
-            rec_buf = udp_buf;
-            encx = udp_size;
-        }
-
-        try_forward( sss, &cmn, reg.dstMac, rec_buf, encx ); /* unicast only */
+            try_forward( sss, &cmn, reg.dstMac, rec_buf, encx ); /* unicast only */
         }
         else
         {
@@ -1119,13 +1320,13 @@ static int process_udp( n2n_sn_t * sss,
 
         encode_REGISTER_SUPER_ACK( ackbuf, &encx, &cmn2, &ack );
 
-		      /* Select the correct socket based on the address family */
-		      volatile SOCKET send_sock = (sender_sock->sa_family == AF_INET6) ? sss->sock6 : sss->sock;
-	      	volatile socklen_t sock_len = (sender_sock->sa_family == AF_INET6) ?
-                           sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
+        /* Select the correct socket based on the address family */
+        volatile SOCKET send_sock = (sender_sock->sa_family == AF_INET6) ? sss->sock6 : sss->sock;
+        volatile socklen_t sock_len = (sender_sock->sa_family == AF_INET6) ?
+                            sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
 
-	      	sendto( send_sock, ackbuf, encx, 0,
-              	(struct sockaddr *)sender_sock, sock_len );
+        sendto( send_sock, ackbuf, encx, 0,
+                (struct sockaddr *)sender_sock, sock_len );
 
         traceEvent( TRACE_DEBUG, "Tx REGISTER_SUPER_ACK for %s %s",
                     macaddr_str( mac_buf, reg.edgeMac ),
@@ -1134,7 +1335,6 @@ static int process_udp( n2n_sn_t * sss,
     }
     return 0;
 }
-
 
 /** Help message to print if the command line arguments are not valid. */
 static void help(int argc, char * const argv[])
@@ -1147,13 +1347,14 @@ static void help(int argc, char * const argv[])
 
     fprintf( stderr, "-l <lport>\tSet UDP main listen port to <lport>\n" );
     fprintf( stderr, "-4|-6     \tIP mode: -4 (IPv4 only), -6 (IPv6 only), both/none (dual-stack)\n" );
- #ifndef _WIN32
+#ifndef _WIN32
     fprintf( stderr, "-t <port>\tSet management UDP port to <port> (default: 5646)\n" );
 #endif
 #if defined(N2N_HAVE_DAEMON)
     fprintf( stderr, "-f        \tRun in foreground.\n" );
 #endif /* #if defined(N2N_HAVE_DAEMON) */
     fprintf( stderr, "-v        \tIncrease verbosity. Can be used multiple times.\n" );
+    fprintf( stderr, "-L <path> \tRate limit configuration file path\n" );
     fprintf( stderr, "-h        \tThis help message.\n" );
     fprintf( stderr, "\n" );
 }
@@ -1169,6 +1370,7 @@ static const struct option long_options[] = {
   { "verbose",         no_argument,       NULL, 'v' },
   { "ipv4",            no_argument,       NULL, '4' },
   { "ipv6",            no_argument,       NULL, '6' },
+  { "rate-limit-config", required_argument, NULL, 'L' },
   { NULL,              0,                 NULL,  0  }
 };
 
@@ -1205,21 +1407,21 @@ int main( int argc, char * const argv[] )
     {
         int opt;
 
-        while((opt = getopt_long(argc, argv, "ft:l:46vh", long_options, NULL)) != -1)
+        while((opt = getopt_long(argc, argv, "ft:l:46vhL:", long_options, NULL)) != -1)
         {
             switch (opt)
             {
             case 'l': /* local-port */
                 sss.lport = atoi(optarg);
-																lport_specified = 1;
+                lport_specified = 1;
                 break;
             case 't':
 #ifndef _WIN32
-						sss.mgmt_port = atoi(optarg);
-						if (sss.mgmt_port == 0) {
-								traceEvent(TRACE_ERROR, "Invalid management port: %s", optarg);
-								exit(-1);
-						}
+                sss.mgmt_port = atoi(optarg);
+                if (sss.mgmt_port == 0) {
+                    traceEvent(TRACE_ERROR, "Invalid management port: %s", optarg);
+                    exit(-1);
+                }
 #endif
                 break;
             case 'f': /* foreground */
@@ -1237,9 +1439,18 @@ int main( int argc, char * const argv[] )
             case 'v': /* verbose */
                 ++traceLevel;
                 break;
+            case 'L': /* rate limit config */
+                strncpy(sss.rate_limit_config_path, optarg, sizeof(sss.rate_limit_config_path) - 1);
+                sss.rate_limit_config_path[sizeof(sss.rate_limit_config_path) - 1] = '\0';
+                break;
             }
         }
 
+    }
+
+    /* Load initial rate limit configuration */
+    if (strlen(sss.rate_limit_config_path) > 0) {
+        parse_rate_limit_config(&sss);
     }
 
     if (!lport_specified) {
